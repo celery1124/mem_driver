@@ -46,7 +46,15 @@
 
 #define MEM_DEBUG
 
-static struct gen_pool *pci_memory_pool;
+typedef struct PCI_MEM_POOL_T PCI_MEM_POOL;
+typedef struct PCI_MEM_POOL_T {
+	unsigned long base_addr;
+	unsigned long base_size;
+	struct gen_pool *pci_memory_pool;
+	PCI_MEM_POOL *next;
+} PCI_MEM_POOL;
+
+static struct PCI_MEM_POOL *pci_memory_pool_list = NULL;
 
 #ifdef MEM_DEBUG
 #define mem_debug(fmt, args...) printk(KERN_ERR "%s: " fmt "\n", __func__, ##args) 
@@ -57,6 +65,7 @@ static struct gen_pool *pci_memory_pool;
 typedef struct MEM_BLOCK_T {
 	unsigned long addr;
 	unsigned long size;
+	struct gen_pool *pci_memory_pool;
 	struct MEM_BLOCK_T *next;
 	struct MEM_BLOCK_T *prev;
 } MEM_BLOCK;
@@ -77,20 +86,38 @@ typedef struct MEM_USER_T {
 /*****************************************************************************/
 static int mem_module_setup_pool(unsigned long base, unsigned long size)
 {
-	// Create memory pool if it doesn't already exist
-	if (!pci_memory_pool) {
-		// Debug output
-		mem_debug("Creating the memory pool (base=%p, size=%p)", (void*)base, (void*)size);
-		// Create PCI memory pool
-		if (!(pci_memory_pool = gen_pool_create(PAGE_SHIFT, -1))) {
-			// Return error
-			return(-EINVAL);	
+	PCI_MEM_POOL *mem_pool = pci_memory_pool_list;
+	
+	while (mem_pool) {
+		if (mem_pool->base_addr == base && mem_pool->base_size == size) {
+			// Found pool, Return success
+			return(0);
 		}
-		// Debug output
-		mem_debug("Added memory to pool (base=%p, size=%p)", (void*)base, (void*)size);
-		// Add physical memory to the pool
-		gen_pool_add(pci_memory_pool, base, size, -1);
+		mem_pool = mem_pool->next;
 	}
+	// Create memory pool if it doesn't already exist
+	if (!(mem_pool = kzalloc(sizeof(PCI_MEM_POOL), GFP_KERNEL))) {
+		// Return out of memory
+		return(-EINVAL);
+	}
+	// Debug output
+	mem_debug("Creating the memory pool (base=%p, size=%p)", (void*)base, (void*)size);
+	// Create PCI memory pool
+	if (!(mem_pool->pci_memory_pool = gen_pool_create(PAGE_SHIFT, -1))) {
+		// Return error
+		return(-EINVAL);	
+	}
+	// Debug output
+	mem_debug("Added memory to pool (base=%p, size=%p)", (void*)base, (void*)size);
+	// Add physical memory to the pool
+	gen_pool_add(mem_pool->pci_memory_pool, base, size, -1);
+
+	// Add to pci memory pool list
+	mem_pool->base_addr = base;
+	mem_pool->base_size = size;
+	mem_pool->next = pci_memory_pool_list;
+	pci_memory_pool_list = mem_pool;
+
 	// Return success
 	return(0);
 }
@@ -104,9 +131,25 @@ static int mem_module_setup_pool(unsigned long base, unsigned long size)
 /* Returns     :                                                             */
 /*                                                                           */
 /*****************************************************************************/
-static MEM_BLOCK *mem_module_allocate(MEM_USER *user, unsigned long size)
+static MEM_BLOCK *mem_module_allocate(MEM_USER *user, unsigned long base, unsigned long size)
 {
 MEM_BLOCK *mem;
+PCI_MEM_POOL *mem_pool = pci_memory_pool_list;
+	
+	// Find corresponded pool
+	while (mem_pool) {
+		if (mem_pool->base_addr == base) {
+			// Found pool
+			break;
+		}
+		mem_pool = mem_pool->next;
+	}
+	if (!mem_pool) {
+		// Debug output
+		mem_debug("No memory Pool found (base=%p, request size=%p)", (void*)base, (void*)size);
+		// Return out of memory
+		return(0);
+	}
 
 	// Allocate the memory object
 	if (!(mem = kzalloc(sizeof(MEM_BLOCK), GFP_KERNEL))) {
@@ -114,14 +157,16 @@ MEM_BLOCK *mem;
 		return(0);
 	}
 	// Allocate memory from pool
-	if (!(mem->addr = gen_pool_alloc(pci_memory_pool, size))) {
+	if (!(mem->addr = gen_pool_alloc(mem_pool->pci_memory_pool, size))) {
 		// Free memory
 		kfree(mem);
+		mem_debug("Out of memory (base=%p, request size=%p)", (void*)base, (void*)size);
 		// Return out of memory
 		return(0);
 	}
 	// Setup size
 	mem->size = size;
+	mem->pci_memory_pool = mem_pool->pci_memory_pool;
 	// Debug
 	mem_debug("Allocated memory (addr=%p, size=%p)", (void*)mem->addr, (void*)mem->size);
 	// Return memory block
@@ -145,46 +190,120 @@ MEM_BLOCK *mem;
 	mem_debug("addr=%p, size=%p", (void*)addr, (void*)size);
 	// Lock the user
 	mutex_lock(&user->lock);
-	// Setup base
-	mem = user->blocks;
-	// Search for this memory block
-	while(mem) {
-		// Is this the correct memory block?
-		if (mem->addr == addr && mem->size == size) {
-			// Free pool memory
-			gen_pool_free(pci_memory_pool, addr, size);
-			// Is this the base?
-			if (user->blocks == mem) {
-				// Rebase
-				user->blocks = mem->next;
-			} else {
-				// Adjust prev link
-				mem->prev->next = mem->next;
-				// Is there a next?
-				if (mem->next) {
-					// Adjust next's prev
-					mem->next->prev = mem->prev;
+	while (size > 0) {
+		// Setup base
+		mem = user->blocks;
+		// Search for this memory block
+		while(mem) {
+			// Is this the correct memory block?
+			if ((addr >= mem->addr && addr < (mem->addr + mem->size))) {
+				// Free pool memory
+				if (addr == mem->addr && size >= mem->size) {
+					gen_pool_free(mem->pci_memory_pool, addr, mem->size);
+					// Is this the base?
+					if (user->blocks == mem) {
+						// Rebase
+						user->blocks = mem->next;
+					} else {
+						// Adjust prev link
+						mem->prev->next = mem->next;
+						// Is there a next?
+						if (mem->next) {
+							// Adjust next's prev
+							mem->next->prev = mem->prev;
+						}
+					}
+					// Free struct
+					kfree(mem);
+					// debug
+					mem_debug("found full: addr=%p, size=%p", (void*)addr, (void*)mem->size);
+
+					size = size - mem->size;
+					addr = addr + mem->size;
+					if (size > 0) {
+						break;
+					}
+					else {
+						// Unlock the user
+						mutex_unlock(&user->lock);
+						// Return success
+						return(0);	
+					}
+				}
+				else if (addr == mem->addr && size < mem->size) {
+					gen_pool_free(mem->pci_memory_pool, addr, size);
+					mem->addr = mem->addr + size;
+					mem->size = mem->size - size;
+					// Unlock the user
+					mutex_unlock(&user->lock);
+					// debug
+					mem_debug("found partial from head: addr=%p, size=%p", (void*)addr, (void*)size);
+					// Return succes
+					return(0);
+				}
+				else if ((addr+size) >= (mem->addr + mem->size)) {
+					gen_pool_free(mem->pci_memory_pool, addr, (mem->addr + mem->size - addr));
+					// debug
+					mem_debug("found partial from tail: addr=%p, size=%p", (void*)addr, (void*)(mem->addr + mem->size - addr));
+
+					size = size - (mem->addr + mem->size - addr);
+					mem->size = addr - mem->addr;
+					addr = mem->addr + mem->size;
+					if (size > 0) {
+						break;
+					}
+					else {
+						// Unlock the user
+						mutex_unlock(&user->lock);
+						// Return succes
+						return(0);
+					}
+				}
+				else {
+					gen_pool_free(mem->pci_memory_pool, addr, size);
+					MEM_BLOCK *new_mem;
+					// Allocate new memory object
+					if (!(new_mem = kzalloc(sizeof(MEM_BLOCK), GFP_KERNEL))) {
+						// Return out of memory
+						mutex_unlock(&user->lock);
+						return(-EINVAL);
+					}
+					mem_debug("allocate new_mem obj");
+					new_mem->addr = addr+size;
+					new_mem->size = (mem->addr + mem->size) - (addr + size);
+					mem_debug("set new_mem");
+					
+					mem->size = addr - mem->addr;
+					// Connect new memory object
+					new_mem->next = mem->next;
+					if (mem->next) {
+						mem->next->prev = new_mem;
+					}
+					new_mem->prev = mem;
+					mem->next = new_mem;
+					new_mem->pci_memory_pool = mem->pci_memory_pool;
+
+					// Unlock the user
+					mutex_unlock(&user->lock);
+					// debug
+					mem_debug("found partial in the middle: addr=%p, size=%p", (void*)addr, (void*)size);
+					// Return success
+					return(0);
 				}
 			}
-			// Free struct
-			kfree(mem);
-			// Unlock the user
-			mutex_unlock(&user->lock);
-			// debug
-			mem_debug("found: addr=%p, size=%p", (void*)addr, (void*)size);
-			// Return success
-			return(0);	
+			// Move to next
+			mem = mem->next;
 		}
-		// Move to next
-		mem = mem->next;
 	}
+	
 	// debug
 	mem_debug("error: addr=%p, size=%p", (void*)addr, (void*)size);
 	// Unlock the user
 	mutex_unlock(&user->lock);
 	// Return error
-	return(-EINVAL);	
+	return(-EINVAL);
 }
+
 
 /*****************************************************************************/
 /*                                                                           */
@@ -254,7 +373,7 @@ MEM_USER *user;
 				return(-EINVAL);	
 			}
 			// Allocate the memory object
-			if (!(mem = mem_module_allocate(user, request.alloc_size))) {
+			if (!(mem = mem_module_allocate(user, request.bar_base, request.alloc_size))) {
 				// Debug
 				mem_debug("Failed to allocate block memory");
 				// Return out of memory
@@ -374,7 +493,7 @@ MEM_BLOCK *mem, *next;
 			// debug
 			mem_debug("Freeing addr=%p, size=%p", (void*)mem->addr, (void*)mem->size);
 			// Free pool memory
-			gen_pool_free(pci_memory_pool, mem->addr, mem->size);
+			gen_pool_free(mem->pci_memory_pool, mem->addr, mem->size);
 			// Free struct
 			kfree(mem);
 			// Move to next
@@ -416,13 +535,22 @@ static struct miscdevice mem_module_dev = {
 /*****************************************************************************/
 static void __exit mem_module_exit(void)
 {
-	// Is there a memory pool?
-	if (pci_memory_pool) {
-		// log message
-		printk(KERN_ERR "freeing memory pool\n");
-		// Deallocate it
-		gen_pool_destroy(pci_memory_pool);
+	PCI_MEM_POOL *mem_pool = pci_memory_pool_list;
+	
+	// Find corresponded pool
+	while (mem_pool) {
+		// Is there a memory pool?
+		if (mem_pool->pci_memory_pool) {
+			// log message
+			printk(KERN_ERR "freeing memory pool (base=%p, size=%p)\n", (void*)mem_pool->base_addr,(void*)mem_pool->base_size);
+			// Deallocate it
+			gen_pool_destroy(mem_pool->pci_memory_pool);
+		}
+		PCI_MEM_POOL *next_mem_pool = mem_pool->next;
+		kfree(mem_pool);
+		mem_pool = next_mem_pool;
 	}
+	
 	// Unregister control device
 	misc_deregister(&mem_module_dev);
 	// Emit kernel log message
