@@ -32,6 +32,7 @@ extern "C" {
 
 #define DRIVER_IOCTL_ALLOC _IO( 0xac, 100)
 #define DRIVER_IOCTL_FREE  _IO( 0xac, 101)
+#define DRIVER_IOCTL_RESET_CNT  _IO( 0xac, 102)
 
 typedef struct MEM_REQUEST_T {
 	unsigned long bar_base;    // In:  PCI BAR address (bytes)

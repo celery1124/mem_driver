@@ -56,6 +56,9 @@ typedef struct PCI_MEM_POOL_T {
 
 static struct PCI_MEM_POOL *pci_memory_pool_list = NULL;
 
+static unsigned int peak_mem = 0;
+static unsigned int curr_mem = 0;
+
 #ifdef MEM_DEBUG
 #define mem_debug(fmt, args...) printk(KERN_ERR "%s: " fmt "\n", __func__, ##args) 
 #else
@@ -392,6 +395,9 @@ MEM_USER *user;
 			}
 			// Add resource
 			mem_module_add_resource(user, mem);
+			// Mem counter
+			curr_mem += mem->size;
+			peak_mem = peak_mem > curr_mem ? peak_mem : curr_mem;
 			// return success
 			return(0);
 
@@ -411,6 +417,15 @@ MEM_USER *user;
 				// Return error
 				return(-EINVAL);	
 			}
+			// Mem counter
+			curr_mem -= request.alloc_size;
+			// return success
+			return(0);
+
+		// Rest Mem counter
+		case DRIVER_IOCTL_RESET_CNT:
+			curr_mem = 0;
+			peak_mem = 0;
 			// return success
 			return(0);
 	}
@@ -504,6 +519,10 @@ MEM_BLOCK *mem, *next;
 		// Free user
 		kfree(user);
 	}
+	// Print & Reset mem counter
+	mem_debug("Peak memory footprint size=%u Byte", (void*)peak_mem);
+	peak_mem = 0;
+	curr_mem = 0;
 	// Return success
 	return(0);
 }
