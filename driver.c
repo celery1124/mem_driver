@@ -520,7 +520,7 @@ MEM_BLOCK *mem, *next;
 		kfree(user);
 	}
 	// Print & Reset mem counter
-	mem_debug("Peak memory footprint size=%u Byte", (void*)peak_mem);
+	mem_debug("Peak memory footprint size=%u Byte", peak_mem);
 	peak_mem = 0;
 	curr_mem = 0;
 	// Return success
