@@ -195,6 +195,7 @@ MEM_BLOCK *mem;
 	mutex_lock(&user->lock);
 	while (size > 0) {
 		// Setup base
+		unsigned long old_size = size;
 		mem = user->blocks;
 		// Search for this memory block
 		while(mem) {
@@ -241,6 +242,7 @@ MEM_BLOCK *mem;
 					mutex_unlock(&user->lock);
 					// debug
 					mem_debug("found partial from head: addr=%p, size=%p", (void*)addr, (void*)size);
+					mem_debug("update mem block: addr=%p, size=%p", (void*)mem->addr, (void*)mem->size);
 					// Return succes
 					return(0);
 				}
@@ -252,6 +254,7 @@ MEM_BLOCK *mem;
 					size = size - (mem->addr + mem->size - addr);
 					mem->size = addr - mem->addr;
 					addr = mem->addr + mem->size;
+					mem_debug("update mem block: addr=%p, size=%p", (void*)mem->addr, (void*)mem->size);
 					if (size > 0) {
 						break;
 					}
@@ -297,6 +300,8 @@ MEM_BLOCK *mem;
 			// Move to next
 			mem = mem->next;
 		}
+		// We didn't find any candidate block to free, return error
+		if (size == old_size) break;
 	}
 	
 	// debug
